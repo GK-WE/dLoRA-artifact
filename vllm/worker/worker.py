@@ -298,6 +298,17 @@ class Worker:
 
         self.adjust_time = 0.0
 
+    def get_swap_stats(self) -> Tuple[int, int, int, int]:
+        """Returns swap statistics from lora_engine: (init_calls, init_swaps, runtime_calls, runtime_swaps)"""
+        if self.exec_type == ExecType.LORA and hasattr(self, 'lora_engine'):
+            return self.lora_engine.get_swap_stats()
+        return (0, 0, 0, 0)
+    
+    def reset_swap_stats(self) -> None:
+        """Resets only runtime swap counters in lora_engine (init stats preserved)."""
+        if self.exec_type == ExecType.LORA and hasattr(self, 'lora_engine'):
+            self.lora_engine.reset_swap_stats()
+
     def init_cache_engine_and_lora(self, cache_config: CacheConfig, init_active_lora_types: List[int]) -> None:
         self.cache_config = cache_config
         self.block_size = cache_config.block_size

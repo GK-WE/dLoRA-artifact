@@ -456,3 +456,20 @@ class EngineManager:
         """Set the output of the engine."""
         for engine in self.engines:
             ray.get(engine.engine.set_output.remote(output))
+
+    def get_swap_stats(self) -> Dict[int, Tuple[int, int, int, int]]:
+        """Get swap statistics from all engines.
+        
+        Returns:
+            Dict mapping engine_id to (init_calls, init_swaps, runtime_calls, runtime_swaps)
+        """
+        stats = {}
+        for engine in self.engines:
+            result = ray.get(engine.engine.get_swap_stats.remote())
+            stats[engine.engine_id] = result
+        return stats
+    
+    def reset_swap_stats(self) -> None:
+        """Reset only runtime swap counters on all engines (init stats preserved)."""
+        for engine in self.engines:
+            ray.get(engine.engine.reset_swap_stats.remote())

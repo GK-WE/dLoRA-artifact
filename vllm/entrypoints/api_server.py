@@ -21,6 +21,36 @@ app = FastAPI()
 engine_manager = None
 
 
+@app.get("/swap_stats")
+async def get_swap_stats() -> JSONResponse:
+    """Get LoRA swap statistics from all engines (init and runtime separated)."""
+    stats = engine_manager.get_swap_stats()
+    # Aggregate totals
+    total_init_calls = sum(s[0] for s in stats.values())
+    total_init_swaps = sum(s[1] for s in stats.values())
+    total_runtime_calls = sum(s[2] for s in stats.values())
+    total_runtime_swaps = sum(s[3] for s in stats.values())
+    return JSONResponse({
+        "per_engine": {
+            str(k): {
+                "init": {"swap_calls": v[0], "swap_count": v[1]},
+                "runtime": {"swap_calls": v[2], "swap_count": v[3]}
+            } for k, v in stats.items()
+        },
+        "total": {
+            "init": {"swap_calls": total_init_calls, "swap_count": total_init_swaps},
+            "runtime": {"swap_calls": total_runtime_calls, "swap_count": total_runtime_swaps}
+        }
+    })
+
+
+@app.post("/reset_swap_stats")
+async def reset_swap_stats() -> JSONResponse:
+    """Reset only runtime LoRA swap statistics on all engines (init stats preserved)."""
+    engine_manager.reset_swap_stats()
+    return JSONResponse({"status": "ok", "message": "Runtime swap stats reset (init stats preserved)"})
+
+
 @app.post("/generate")
 async def generate(request: Request) -> Response:
     """Generate completion for the request.

@@ -503,6 +503,22 @@ class LLMEngine:
         num_free_gpu_blocks -= self.scheduler.get_swapped_block_num()
         return num_free_gpu_blocks
 
+    def get_swap_stats(self) -> Tuple[int, int, int, int]:
+        """Returns aggregated swap statistics from all workers.
+        
+        Returns: (init_calls, init_swaps, runtime_calls, runtime_swaps)
+        """
+        results = self._run_workers("get_swap_stats", get_all_outputs=True)
+        init_calls = sum(r[0] for r in results)
+        init_swaps = sum(r[1] for r in results)
+        runtime_calls = sum(r[2] for r in results)
+        runtime_swaps = sum(r[3] for r in results)
+        return init_calls, init_swaps, runtime_calls, runtime_swaps
+    
+    def reset_swap_stats(self) -> None:
+        """Resets only runtime swap counters on all workers (init stats preserved)."""
+        self._run_workers("reset_swap_stats")
+
     def _get_avg_jct(self) -> float:
         if len(self.jct_stats) == 0:
             avg_jct = 0.0

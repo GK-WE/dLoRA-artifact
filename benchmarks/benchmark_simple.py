@@ -12,6 +12,8 @@ from transformers import PreTrainedTokenizerBase
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 REQUEST_LATENCY: List[Tuple[int, int, float]] = []
+SENT_COUNT = 0
+RECEIVED_COUNT = 0
 
 
 def sample_requests(
@@ -75,6 +77,7 @@ async def send_request(
     model_id: int,
 ) -> None:
     """Send a single request."""
+    global RECEIVED_COUNT
     request_start_time = time.time()
     
     pload = {
@@ -97,6 +100,16 @@ async def send_request(
     request_end_time = time.time()
     request_latency = request_end_time - request_start_time
     REQUEST_LATENCY.append((prompt_len, output_len, request_latency))
+    RECEIVED_COUNT += 1
+
+
+async def progress_printer(total_requests: int, interval: float = 2.0) -> None:
+    """Periodically print progress of sent and received requests."""
+    start_time = time.time()
+    while RECEIVED_COUNT < total_requests:
+        elapsed = time.time() - start_time
+        print(f"[{elapsed:6.1f}s] Sent: {SENT_COUNT:4d}/{total_requests}  |  Received: {RECEIVED_COUNT:4d}/{total_requests}")
+        await asyncio.sleep(interval)
 
 
 async def benchmark(
@@ -106,8 +119,13 @@ async def benchmark(
     request_rate: float,
 ) -> None:
     """Run the benchmark."""
+    global SENT_COUNT
     tasks = []
     timeout = aiohttp.ClientTimeout(total=3600)
+    total_requests = len(input_requests)
+    
+    # Start progress printer
+    printer_task = asyncio.create_task(progress_printer(total_requests))
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for i, (prompt, prompt_len, output_len) in enumerate(input_requests):
@@ -116,12 +134,46 @@ async def benchmark(
                 send_request(session, api_url, prompt, prompt_len, output_len, model_id)
             )
             tasks.append(task)
+            SENT_COUNT += 1
             
             if request_rate < float("inf"):
                 interval = np.random.exponential(1.0 / request_rate)
                 await asyncio.sleep(interval)
         
         await asyncio.gather(*tasks)
+    
+    # Cancel the printer task once all requests are done
+    printer_task.cancel()
+    try:
+        await printer_task
+    except asyncio.CancelledError:
+        pass
+    
+    # Print final status
+    print(f"[DONE]   Sent: {SENT_COUNT:4d}/{total_requests}  |  Received: {RECEIVED_COUNT:4d}/{total_requests}")
+
+
+def reset_swap_stats(host: str, port: int) -> None:
+    """Reset swap stats on the server."""
+    import requests
+    try:
+        resp = requests.post(f"http://{host}:{port}/reset_swap_stats", timeout=10)
+        if resp.status_code == 200:
+            print("Swap stats reset on server")
+    except Exception as e:
+        print(f"Warning: Could not reset swap stats: {e}")
+
+
+def get_swap_stats(host: str, port: int) -> dict:
+    """Get swap stats from the server."""
+    import requests
+    try:
+        resp = requests.get(f"http://{host}:{port}/swap_stats", timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"Warning: Could not get swap stats: {e}")
+    return None
 
 
 def main(args):
@@ -132,6 +184,9 @@ def main(args):
     api_url = f"http://{args.host}:{args.port}/generate"
     tokenizer = get_tokenizer(args.tokenizer)
     input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+
+    # Reset swap stats before benchmark
+    reset_swap_stats(args.host, args.port)
 
     print(f"\nStarting benchmark with {len(input_requests)} requests...")
     print(f"Request rate: {args.request_rate} req/s")
@@ -155,6 +210,9 @@ def main(args):
         latency / output_len for _, output_len, latency in REQUEST_LATENCY
     ])
 
+    # Get swap stats from server
+    swap_stats = get_swap_stats(args.host, args.port)
+
     print("=" * 50)
     print("BENCHMARK RESULTS")
     print("=" * 50)
@@ -168,7 +226,26 @@ def main(args):
     print(f"P99 latency:           {p99_latency:.2f} s")
     print()
     print(f"Avg latency/output_token: {avg_per_output_token:.4f} s")
+    print()
+    if swap_stats:
+        print("LoRA SWAP STATISTICS")
+        print("-" * 30)
+        print("Initialization:")
+        print(f"  Total swap operations: {swap_stats['total']['init']['swap_calls']}")
+        print(f"  Total models swapped:  {swap_stats['total']['init']['swap_count']}")
+        print("Runtime:")
+        print(f"  Total swap operations: {swap_stats['total']['runtime']['swap_calls']}")
+        print(f"  Total models swapped:  {swap_stats['total']['runtime']['swap_count']}")
+        print("-" * 30)
+        print("Per-engine breakdown:")
+        for engine_id, stats in swap_stats['per_engine'].items():
+            print(f"  Engine {engine_id}:")
+            print(f"    Init:    {stats['init']['swap_calls']} ops, {stats['init']['swap_count']} models")
+            print(f"    Runtime: {stats['runtime']['swap_calls']} ops, {stats['runtime']['swap_count']} models")
     print("=" * 50)
+
+    # Reset runtime swap stats at the end (init stats preserved)
+    reset_swap_stats(args.host, args.port)
 
 
 if __name__ == "__main__":

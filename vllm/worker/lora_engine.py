@@ -95,6 +95,15 @@ class LoRaEngine:
         self.gpu_lora_weights: List[self.lora_type] = []
         self.cpu_lora_weights: List[self.lora_type] = []
 
+        # LoRA swap tracking counters
+        self.is_initialized = False  # Flag to distinguish init vs runtime swaps
+        # Initialization swap counters
+        self.init_swap_in_count = 0  # Models swapped during initialization
+        self.init_swap_call_count = 0  # Swap operations during initialization
+        # Runtime swap counters  
+        self.runtime_swap_in_count = 0  # Models swapped during runtime
+        self.runtime_swap_call_count = 0  # Swap operations during runtime
+
         # Initialize the stream for lora swap operations.
         self.lora_stream = torch.cuda.Stream()
         assert self.lora_stream != torch.cuda.current_stream()
@@ -114,17 +123,27 @@ class LoRaEngine:
         if gpu_lora_list == self.gpu_lora_models:
             return False
         self.num_gpu_lora = len(gpu_lora_list)
-        swapped = False
+        models_swapped = 0
 
         with torch.cuda.stream(self.lora_stream):
             for idx, model_id in enumerate(gpu_lora_list):
                 if idx < len(self.gpu_lora_models) and self.gpu_lora_models[idx] == model_id:
                     continue
-                swapped = True
+                models_swapped += 1
                 self.copy_into_gpu(idx, model_id)
 
+        if models_swapped > 0:
+            if self.is_initialized:
+                self.runtime_swap_call_count += 1
+                self.runtime_swap_in_count += models_swapped
+                logger.info(f"LoRA runtime swap #{self.runtime_swap_call_count}: {models_swapped} models swapped in, total runtime swaps: {self.runtime_swap_in_count}")
+            else:
+                self.init_swap_call_count += 1
+                self.init_swap_in_count += models_swapped
+                logger.info(f"LoRA init swap #{self.init_swap_call_count}: {models_swapped} models swapped in")
+
         self.gpu_lora_models = gpu_lora_list.copy()
-        return swapped
+        return models_swapped > 0
             
     def adjust_lora_adapter(self, gpu_model_list: List[int], active_model_list: List[int]) -> bool:
         swapped = self.set_gpu_lora(gpu_model_list)
@@ -142,6 +161,28 @@ class LoRaEngine:
     def get_size(self):
         dtype_size = _get_dtype_size(self.model_config.dtype)
         return dtype_size * sum([self.lora_A_shapes[i][0] * self.lora_A_shapes[i][1] + self.lora_B_shapes[i][0] * self.lora_B_shapes[i][1] for i in range(self.lora_cnt)]) * self.num_hidden_layers
+
+    def mark_initialized(self):
+        """Mark initialization as complete. Future swaps will be tracked as runtime swaps.
+        
+        This is called once at the end of allocate_gpu_lora_weight().
+        If called multiple times, only the first call takes effect.
+        """
+        if self.is_initialized:
+            logger.warning("mark_initialized() called but already initialized, ignoring")
+            return
+        self.is_initialized = True
+        logger.info(f"LoRA engine initialized with {self.init_swap_in_count} models loaded in {self.init_swap_call_count} operations")
+
+    def get_swap_stats(self):
+        """Returns swap statistics: (init_calls, init_swaps, runtime_calls, runtime_swaps)"""
+        return (self.init_swap_call_count, self.init_swap_in_count, 
+                self.runtime_swap_call_count, self.runtime_swap_in_count)
+    
+    def reset_swap_stats(self):
+        """Resets only runtime swap counters (init stats preserved)."""
+        self.runtime_swap_call_count = 0
+        self.runtime_swap_in_count = 0
 
 
 class OPTLoRaEngine(LoRaEngine):
@@ -190,6 +231,7 @@ class OPTLoRaEngine(LoRaEngine):
                                         self.lora_config.max_r, self.hidden_size, self.model_config.dtype, device=self.device)))
             
         self.adjust_lora_adapter(lora_types, lora_types)
+        self.mark_initialized()
 
 class LlamaLoRaEngine(LoRaEngine):
     lora_type = Tuple[LoRaWeight, LoRaWeight, LoRaWeight, LoRaWeight] # qkv_proj, o_proj, gate_up_proj, down_proj
@@ -240,6 +282,7 @@ class LlamaLoRaEngine(LoRaEngine):
                                         self.lora_config.max_r, self.hidden_size, self.model_config.dtype, device=self.device)))
             
         self.adjust_lora_adapter(lora_types, lora_types)
+        self.mark_initialized()
 
 
 
