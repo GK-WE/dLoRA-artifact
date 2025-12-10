@@ -14,14 +14,44 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 REQUEST_LATENCY: List[Tuple[int, int, float]] = []
 SENT_COUNT = 0
 RECEIVED_COUNT = 0
+SENT_MODEL_IDS: List[int] = []
+
+
+def get_skewed_model_weights(num_models: int, skewness: float) -> np.ndarray:
+    """Generate probability weights for model selection with skewness.
+    
+    Args:
+        num_models: Number of LoRA models
+        skewness: Skewness parameter (0 = uniform, higher = more skewed to lower IDs)
+                  Uses Zipf-like distribution: P(i) ∝ 1/(i+1)^skewness
+    
+    Returns:
+        Normalized probability weights for each model
+    """
+    if skewness == 0:
+        return np.ones(num_models) / num_models
+    weights = np.array([1.0 / (i + 1) ** skewness for i in range(num_models)])
+    return weights / weights.sum()
 
 
 def sample_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    input_len_min: int,
+    input_len_max: int,
+    output_len: int,
 ) -> List[Tuple[str, int, int]]:
-    """Sample requests from the dataset."""
+    """Sample requests from the dataset.
+    
+    Args:
+        dataset_path: Path to ShareGPT dataset
+        num_requests: Number of requests to sample
+        tokenizer: Tokenizer to use
+        input_len_min: Minimum input token length (inclusive)
+        input_len_max: Maximum input token length (inclusive)
+        output_len: Fixed output token length for all requests
+    """
     with open(dataset_path) as f:
         dataset = json.load(f)
     
@@ -39,31 +69,36 @@ def sample_requests(
     # Tokenize
     prompts = [prompt for prompt, _ in dataset]
     prompt_token_ids = tokenizer(prompts).input_ids
-    completions = [completion for _, completion in dataset]
-    completion_token_ids = tokenizer(completions).input_ids
     
     tokenized_dataset = []
     for i in range(len(dataset)):
-        output_len = len(completion_token_ids[i])
-        tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
+        tokenized_dataset.append((prompts[i], prompt_token_ids[i]))
 
-    # Filter out too long/short sequences
+    # Filter based on input token length range
     filtered_dataset = []
-    for prompt, prompt_token_ids, output_len in tokenized_dataset:
-        prompt_len = len(prompt_token_ids)
-        if prompt_len < 4 or output_len < 4:
+    for prompt, tokens in tokenized_dataset:
+        prompt_len = len(tokens)
+        # Filter by user-specified input length range
+        if prompt_len < input_len_min or prompt_len > input_len_max:
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            continue
+        # Use user-specified fixed output length
         filtered_dataset.append((prompt, prompt_len, output_len))
+
+    if len(filtered_dataset) == 0:
+        raise ValueError(f"No requests found with input length in range [{input_len_min}, {input_len_max}]. "
+                         f"Try adjusting the range.")
+    
+    if len(filtered_dataset) < num_requests:
+        print(f"Warning: Only {len(filtered_dataset)} requests available in range [{input_len_min}, {input_len_max}], "
+              f"requested {num_requests}")
 
     sampled_requests = random.sample(filtered_dataset, min(num_requests, len(filtered_dataset)))
     
     prompt_lens = [t[1] for t in sampled_requests]
-    output_lens = [t[2] for t in sampled_requests]
     print(f"Sampled {len(sampled_requests)} requests")
-    print(f"avg_prompt_len: {sum(prompt_lens) / len(prompt_lens):.1f}")
-    print(f"avg_output_len: {sum(output_lens) / len(output_lens):.1f}")
+    print(f"Input length range: [{input_len_min}, {input_len_max}]")
+    print(f"Actual input length: min={min(prompt_lens)}, max={max(prompt_lens)}, avg={sum(prompt_lens) / len(prompt_lens):.1f}")
+    print(f"Output length (fixed): {output_len}")
     
     return sampled_requests
 
@@ -117,6 +152,7 @@ async def benchmark(
     input_requests: List[Tuple[str, int, int]],
     num_models: int,
     request_rate: float,
+    skewness: float,
 ) -> None:
     """Run the benchmark."""
     global SENT_COUNT
@@ -124,17 +160,22 @@ async def benchmark(
     timeout = aiohttp.ClientTimeout(total=3600)
     total_requests = len(input_requests)
     
+    # Compute model selection weights based on skewness
+    model_weights = get_skewed_model_weights(num_models, skewness)
+    model_ids = np.arange(num_models)
+    
     # Start progress printer
     printer_task = asyncio.create_task(progress_printer(total_requests))
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for i, (prompt, prompt_len, output_len) in enumerate(input_requests):
-            model_id = random.randint(0, num_models - 1)
+            model_id = int(np.random.choice(model_ids, p=model_weights))
             task = asyncio.create_task(
                 send_request(session, api_url, prompt, prompt_len, output_len, model_id)
             )
             tasks.append(task)
             SENT_COUNT += 1
+            SENT_MODEL_IDS.append(model_id)
             
             if request_rate < float("inf"):
                 interval = np.random.exponential(1.0 / request_rate)
@@ -149,8 +190,13 @@ async def benchmark(
     except asyncio.CancelledError:
         pass
     
-    # Print final status
+    # Print final status with total model ID distribution
+    total_model_counts = {}
+    for mid in SENT_MODEL_IDS:
+        total_model_counts[mid] = total_model_counts.get(mid, 0) + 1
+    total_model_str = ", ".join(f"{k}:{v}" for k, v in sorted(total_model_counts.items()))
     print(f"[DONE]   Sent: {SENT_COUNT:4d}/{total_requests}  |  Received: {RECEIVED_COUNT:4d}/{total_requests}")
+    print(f"         Total LoRA ID distribution: {total_model_str}")
 
 
 def reset_swap_stats(host: str, port: int) -> None:
@@ -183,7 +229,14 @@ def main(args):
 
     api_url = f"http://{args.host}:{args.port}/generate"
     tokenizer = get_tokenizer(args.tokenizer)
-    input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+    input_requests = sample_requests(
+        args.dataset, 
+        args.num_prompts, 
+        tokenizer,
+        args.input_len_min,
+        args.input_len_max,
+        args.output_len,
+    )
 
     # Reset swap stats before benchmark
     reset_swap_stats(args.host, args.port)
@@ -191,10 +244,11 @@ def main(args):
     print(f"\nStarting benchmark with {len(input_requests)} requests...")
     print(f"Request rate: {args.request_rate} req/s")
     print(f"Number of LoRA models: {args.num_models}")
+    print(f"LoRA skewness: {args.skewness} (0=uniform, higher=more skewed)")
     print()
 
     benchmark_start_time = time.time()
-    asyncio.run(benchmark(api_url, input_requests, args.num_models, args.request_rate))
+    asyncio.run(benchmark(api_url, input_requests, args.num_models, args.request_rate, args.skewness))
     benchmark_end_time = time.time()
     
     benchmark_time = benchmark_end_time - benchmark_start_time
@@ -262,6 +316,14 @@ if __name__ == "__main__":
                         help="Number of LoRA models")
     parser.add_argument("--request-rate", type=float, default=4.0,
                         help="Requests per second (use 'inf' for max)")
+    parser.add_argument("--input-len-min", type=int, default=128,
+                        help="Minimum input token length (inclusive)")
+    parser.add_argument("--input-len-max", type=int, default=512,
+                        help="Maximum input token length (inclusive)")
+    parser.add_argument("--output-len", type=int, default=128,
+                        help="Fixed output token length for all requests")
+    parser.add_argument("--skewness", type=float, default=2.0,
+                        help="Skewness for LoRA model selection (0=uniform, higher=more skewed to lower IDs)")
     parser.add_argument("--seed", type=int, default=0)
     
     args = parser.parse_args()
