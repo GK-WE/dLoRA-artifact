@@ -298,11 +298,11 @@ class Worker:
 
         self.adjust_time = 0.0
 
-    def get_swap_stats(self) -> Tuple[int, int, int, int]:
-        """Returns swap statistics from lora_engine: (init_calls, init_swaps, runtime_calls, runtime_swaps)"""
+    def get_swap_stats(self) -> Tuple[int, int, int, int, int, int]:
+        """Returns swap statistics from lora_engine: (init_calls, init_swaps, runtime_calls, runtime_swaps, ondemand_calls, ondemand_swaps)"""
         if self.exec_type == ExecType.LORA and hasattr(self, 'lora_engine'):
             return self.lora_engine.get_swap_stats()
-        return (0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0)
     
     def reset_swap_stats(self) -> None:
         """Resets only runtime swap counters in lora_engine (init stats preserved)."""
@@ -550,6 +550,16 @@ class Worker:
                 output.update(model_output)
 
         else:
+            # Compute actual models needed from the batch
+            if seq_group_metadata_list:
+                actual_models_in_batch = sorted(set(
+                    seq_group.model_id for seq_group in seq_group_metadata_list
+                    if hasattr(seq_group, 'model_id')
+                ))
+                logger.info(f"Batch models - Scheduler active: {active_model_list}, "
+                            f"Actual in batch: {actual_models_in_batch}, "
+                            f"Cached: {gpu_model_list}")
+            
             adjusted = self.adjust_lora_adapter(gpu_model_list, active_model_list)
             input_tokens, input_positions, input_metadata = self._prepare_inputs(
                 seq_group_metadata_list)
