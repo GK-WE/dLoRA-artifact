@@ -129,13 +129,30 @@ async def send_request(
     headers = {"User-Agent": "Benchmark Client"}
     timeout = aiohttp.ClientTimeout(total=3600)
     
-    async with session.post(api_url, headers=headers, json=pload) as response:
-        output = await response.text()
-    
-    request_end_time = time.time()
-    request_latency = request_end_time - request_start_time
-    REQUEST_LATENCY.append((prompt_len, output_len, request_latency))
-    RECEIVED_COUNT += 1
+    try:
+        async with session.post(api_url, headers=headers, json=pload, timeout=timeout) as response:
+            if response.status != 200:
+                print(f"ERROR: Request failed with status {response.status} for model_id {model_id}")
+                output = await response.text()
+                print(f"Response: {output[:200]}")
+            else:
+                output = await response.text()
+        
+        request_end_time = time.time()
+        request_latency = request_end_time - request_start_time
+        REQUEST_LATENCY.append((prompt_len, output_len, request_latency))
+    except asyncio.TimeoutError:
+        print(f"ERROR: Request timeout for model_id {model_id} after {timeout.total}s")
+        request_end_time = time.time()
+        request_latency = request_end_time - request_start_time
+        REQUEST_LATENCY.append((prompt_len, output_len, request_latency))
+    except Exception as e:
+        print(f"ERROR: Request failed for model_id {model_id}: {type(e).__name__}: {e}")
+        request_end_time = time.time()
+        request_latency = request_end_time - request_start_time
+        REQUEST_LATENCY.append((prompt_len, output_len, request_latency))
+    finally:
+        RECEIVED_COUNT += 1
 
 
 async def progress_printer(total_requests: int, interval: float = 2.0) -> None:
@@ -290,12 +307,13 @@ def main(args):
         print("Runtime:")
         print(f"  Total swap operations: {swap_stats['total']['runtime']['swap_calls']}")
         print(f"  Total models swapped:  {swap_stats['total']['runtime']['swap_count']}")
-        print("-" * 30)
         print("Per-engine breakdown:")
         for engine_id, stats in swap_stats['per_engine'].items():
             print(f"  Engine {engine_id}:")
-            print(f"    Init:    {stats['init']['swap_calls']} ops, {stats['init']['swap_count']} models")
-            print(f"    Runtime: {stats['runtime']['swap_calls']} ops, {stats['runtime']['swap_count']} models")
+            print(f"    Init:     {stats['init']['swap_calls']} ops, {stats['init']['swap_count']} models")
+            print(f"    Runtime:  {stats['runtime']['swap_calls']} ops, {stats['runtime']['swap_count']} models")
+            if 'ondemand' in stats:
+                print(f"    On-demand: {stats['ondemand']['load_calls']} ops, {stats['ondemand']['load_count']} models")
     print("=" * 50)
 
     # Reset runtime swap stats at the end (init stats preserved)
